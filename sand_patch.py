@@ -2,7 +2,8 @@
 
 规则分组：
   - 客户端身份 / 资格 / 会员伪装（渲染层与扩展宿主）
-  - Stream 回路：managed-local 路由 + 本地 runtime + agent-host sand 身份 + move_exec
+  - Stream 回路：managed-local 路由 + 本地 runtime + agent-host sand 身份
+    （move_exec 门控保持官方值；1.1.9 及更早版本强制开启的写法会在 install 时还原）
   - 子代理：Task 工具、resume/summarize/后台完成动作放行、Multitask 等模式放行（agent-host）
     与后台子代理完成唤醒（渲染层）
 支持桌面版与 Remote SSH 服务端（~/.cursor-server/bin/<os>/<commit>，无渲染层）两种布局。
@@ -40,7 +41,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 
-TOOL_VERSION = "1.1.9"
+TOOL_VERSION = "1.1.10"
 CONFIG_VERSION = 1
 
 SAND_CLIENT_MARKER = "/*SAND_CLIENT_MODE_V1*/"
@@ -81,13 +82,15 @@ SAND_AGENT_HOST_IDENTITY_MARKER = "/*SAND_AGENT_HOST_IDENTITY_V1*/"
 SAND_AGENTEXEC_KEEP_MARKER = "/*SAND_AGENTEXEC_KEEP_V1*/"
 SAND_AGENT_IDE_MARKER = "/*SAND_AGENT_IDE_V1*/"
 SAND_STREAM_HOOK_MARKER = "/*SAND_STREAM_HOOK_V1*/"
+# 1.1.9 及更早版本把 cursor_agent_host_move_exec 门控强制为真（marker 见下）。1.1.10 起不再
+# 强制：这两个 marker 都视为「旧版残留」，install / uninstall 时按 marker 还原为官方原文。
+# 原因见下文 4) 的说明（强制 move_exec 会让每条消息首 token 固定多等 10 秒）。
 SAND_MOVE_EXEC_MARKER = "/*SAND_MOVE_EXEC_V1*/"
-# 1.1.8 之前的 Stream 安装器使用过这个标记名。它对应的代码已经把
-# move-exec gate 强制为真；升级时必须识别它，否则会把一个有效的旧补丁
-# 误报成「锚点缺失」并拒绝补丁。
+# 1.1.8 之前的 Stream 安装器使用过这个标记名，且直接丢弃了原门控表达式。
 LEGACY_MOVE_EXEC_MARKERS: Tuple[str, ...] = (
     "/*SAND_AGENT_HOST_MOVE_EXEC_V1*/",
 )
+MOVE_EXEC_MARKERS: Tuple[str, ...] = (SAND_MOVE_EXEC_MARKER,) + LEGACY_MOVE_EXEC_MARKERS
 # 子代理（Task 工具）组：让 managed-local 运行时也能派生/恢复子代理。
 # 官方 managed-local 门控默认把 subagent 相关 run options、resume/summarize/
 # backgroundTaskCompletion 动作全部踢回 connect（服务端 agent），并把 taskToolProps 置空。
@@ -125,11 +128,13 @@ LEGACY_SUBAGENT_MARKERS: Tuple[str, ...] = (
 # 子代理运行链就绪锚点：这些是 Cursor 本地运行时里稳定的日志/工厂字面量，缺任何一个都说明
 # 当前构建没有对应代码路径，此时注入 taskToolProps 只会得到一个永远失败的 Task 工具。
 # 只在 cursor-agent-host 扩展目录内统计。
+# execRuntimeReady：move_exec 门控为官方值（OFF）时 host 走的分支——从 cursor-agent-exec 取共享
+# 运行时并激活它（该运行时同时负责向 workbench 推送 rules / skills / 子代理），工具执行器由它提供。
 SUBAGENT_READY_ANCHORS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     (
-        "moveExecReady",
+        "execRuntimeReady",
         re.compile(
-            re.escape("move_exec ON: using @anysphere/agent-host-exec for session resources")
+            re.escape("Acquired shared agent runtime from cursor-agent-exec")
         ),
     ),
     ("taskRunnerReady", re.compile(re.escape("Creating subagent and starting execution"))),
@@ -168,12 +173,13 @@ SAND_MEMBERSHIP_SNIPPET = (
 )
 
 # Stream 核心：managed-local + 本地 runtime + agent-host sand 身份
-# + 强制开启 agent host + 强制 move_exec。
+# + 强制开启 agent host。move_exec 门控保持官方值（见下文 4)）。
 # 1.1.1–1.1.3 曾把 hre() 短路成 Joe(raw client)，工具 get(CP._As) 落到 undefined.execute。
 # 1.1.3 曾删掉强制 host 后的 return（AGENTEXEC_KEEP），workbench 继续等 agent-exec。
 # 实测 14:11 日志：agent-exec 注册 30s+ 连超时，界面就是「超长时间」，
-# 最终 ERROR_EXTENSION_HOST_TIMEOUT。ThankCat 1.0.8 靠 move_exec 走同包
-# createAgentHostExec，不会去等这段。1.1.5 打补丁时剥掉残留 KEEP。
+# 最终 ERROR_EXTENSION_HOST_TIMEOUT。1.1.5 打补丁时剥掉残留 KEEP。
+# 1.1.4–1.1.9 仿 ThankCat 1.0.8 强制 move_exec 走同包 createAgentHostExec；1.1.10 发现它正是
+# 「每条消息首 token 多等 10 秒」的根因，改回官方门控。
 
 # 只往这两个 renderer 包注入会员伪装（有 fetch/window）。
 MEMBERSHIP_TARGET_NAMES = ("workbench.desktop.main.js", "workbench.glass.main.js")
@@ -433,18 +439,23 @@ class PatchStatus:
 
     @property
     def stream_mode_installed(self) -> bool:
-        # 1.1.3 短路 createPromptSession、只强制 managed-local 却不开
-        # move_exec，都会让工具 get(CP._As) 落到 undefined.execute。
+        # 1.1.3 短路 createPromptSession 会让工具 get(CP._As) 落到 undefined.execute，
+        # 所以 direct_stream 必须为 0。move_exec 门控 1.1.10 起保持官方值，不再是必需锚点；
+        # 残留的强制写法由 legacy_move_exec_forced 单独提示。
         # agent-host enablement 锚点在 workbench 渲染层；Remote SSH 服务端没有该文件，
-        # 由本机客户端那份 workbench 提供，服务端只校验扩展宿主侧四类锚点。
+        # 由本机客户端那份 workbench 提供，服务端只校验扩展宿主侧三类锚点。
         return (
             self.managed_local_route_markers > 0
             and self.local_runtime_load_markers > 0
             and self.direct_stream_markers == 0
             and (self.remote_server or self.agent_host_enablement_markers > 0)
             and self.agent_host_identity_markers > 0
-            and self.move_exec_markers > 0
         )
+
+    @property
+    def legacy_move_exec_forced(self) -> bool:
+        """1.1.9 及更早版本强制开启 move_exec 的残留：每条消息首 token 多等约 10 秒。"""
+        return self.move_exec_markers > 0
 
 
 def _compile_client_rules() -> Tuple[Tuple[str, re.Pattern[str]], ...]:
@@ -574,35 +585,40 @@ STREAM_HOOK_REMOVE_RE = re.compile(
     + re.escape(SAND_STREAM_HOOK_MARKER)
     + r';'
 )
-# 4) move_exec 网关：强制为真，让 host 用同包 createAgentHostExec 提供工具执行器。
+# 4) move_exec 网关（cursor_agent_host_move_exec）：保持官方值，不再强制为真。
+#    1.1.4–1.1.9 把它强制为 !0，让 host 用同包 createAgentHostExec 提供工具执行器。但 move_exec
+#    ON 时 host 不再激活 cursor-agent-exec 的运行时（日志：move_exec ON ... no cursor-agent-exec
+#    runtime），而只有该运行时会向 workbench 推送 Cursor Rules / Agent Skills / 自定义子代理
+#    （$updateCursorRules 等）。workbench 的 WorkbenchRequestContextExecutor.buildFromPushedData
+#    每条消息都要 await 推送来的 rules，peek 不到就等满 10s 超时——requestTraces 实测
+#    buildFromPushedData=10006ms、client.ttft≈10.7s，而 grok-4.6 真正的网络+模型首 token 只有
+#    1~2s；同时 rules/skills 从不进 prompt。门控为 OFF 时 host 走官方默认路径：
+#    createLiveExecRuntime 从 cursor-agent-exec 取共享运行时并激活，rules 正常推送，
+#    工具执行器由该运行时提供。
+#    这里只负责把旧版强制写法还原为官方原文（install 与 uninstall 共用）。
 #    用稳定的 createAgentHost), 前缀锁定到唯一一处，绝不误伤同文件里另外两个同构 gate
 #    （native cloud subagent ownership / subagent interaction policy）。
-#    原 gate 读取用 !0||await... 短路保留（永不求值），卸载时精确还原。
 MOVE_EXEC_GATE_RE = re.compile(
     r"(createAgentHost\),)(\w+)=await Promise\.resolve\("
     r"(\w+\.cursor\.checkFeatureGate\(\w+\))\)\.catch\(\(\)=>!1\)"
 )
+# 1.1.8–1.1.9 写法：原 gate 读取以 !0||await... 死代码保留，可直接精确还原。
 MOVE_EXEC_GATE_RESTORE_RE = re.compile(
     r"(createAgentHost\),)(\w+)=!0"
     + re.escape(SAND_MOVE_EXEC_MARKER)
     + r"\|\|await Promise\.resolve\("
     r"(\w+\.cursor\.checkFeatureGate\(\w+\))\)\.catch\(\(\)=>!1\)"
 )
-
-
-def _move_exec_gate_sub(match: "re.Match[str]") -> str:
-    prefix = match.group(1)
-    var = match.group(2)
-    gate = match.group(3)
-    return (
-        prefix
-        + var
-        + "=!0"
-        + SAND_MOVE_EXEC_MARKER
-        + "||await Promise.resolve("
-        + gate
-        + ").catch(()=>!1)"
-    )
+# 1.1.8 之前的写法丢弃了原表达式，只剩 `p=!0/*SAND_AGENT_HOST_MOVE_EXEC_V1*/`。原文形如
+# `p=await Promise.resolve(r.cursor.checkFeatureGate(Us)).catch(()=>!1)`：vscode 别名 r 从同一
+# 语句里紧随其后的 native-cloud-subagent 门控读取取回，门控常量名 Us 按其字面量
+# "cursor_agent_host_move_exec" 在文件内反查，据此重建。
+MOVE_EXEC_GATE_LEGACY_RE = re.compile(
+    r"(createAgentHost\),)([\w$]+)=!0(?:"
+    + "|".join(re.escape(marker) for marker in LEGACY_MOVE_EXEC_MARKERS)
+    + r")(?=,[\w$]+=await Promise\.resolve\(([\w$]+)\.cursor\.checkFeatureGate\()"
+)
+MOVE_EXEC_GATE_NAME_RE = re.compile(r'([\w$]+)="cursor_agent_host_move_exec"')
 
 
 def _move_exec_gate_restore(match: "re.Match[str]") -> str:
@@ -610,6 +626,29 @@ def _move_exec_gate_restore(match: "re.Match[str]") -> str:
     var = match.group(2)
     gate = match.group(3)
     return prefix + var + "=await Promise.resolve(" + gate + ").catch(()=>!1)"
+
+
+def _restore_move_exec_gates(content: str) -> Tuple[str, int]:
+    """把所有旧版强制 move_exec 的写法还原为官方门控读取。返回 (新内容, 还原数)。"""
+    content, total = MOVE_EXEC_GATE_RESTORE_RE.subn(_move_exec_gate_restore, content)
+    if not any(marker in content for marker in LEGACY_MOVE_EXEC_MARKERS):
+        return content, total
+    gate_match = MOVE_EXEC_GATE_NAME_RE.search(content)
+    if gate_match is None:
+        return content, total
+    gate_var = gate_match.group(1)
+
+    def _legacy_restore(match: "re.Match[str]") -> str:
+        prefix = match.group(1)
+        var = match.group(2)
+        vscode = match.group(3)
+        return (
+            f"{prefix}{var}=await Promise.resolve("
+            f"{vscode}.cursor.checkFeatureGate({gate_var})).catch(()=>!1)"
+        )
+
+    content, legacy_count = MOVE_EXEC_GATE_LEGACY_RE.subn(_legacy_restore, content)
+    return content, total + legacy_count
 
 
 # 5) 子代理组（agent-host dist 657/675 chunk）。所有规则均按 marker 精确还原，字节级可回退。
@@ -1006,10 +1045,8 @@ def _content_has_stream_anchors(content: str) -> bool:
 
 
 def _move_exec_marker_count(content: str) -> int:
-    """Count current and pre-1.1.8 move-exec markers as the same capability."""
-    return content.count(SAND_MOVE_EXEC_MARKER) + sum(
-        content.count(marker) for marker in LEGACY_MOVE_EXEC_MARKERS
-    )
+    """旧版（≤1.1.9）强制 move_exec 的残留 marker 数，含 1.1.8 之前的标记名。"""
+    return sum(content.count(marker) for marker in MOVE_EXEC_MARKERS)
 
 
 def _platform_name() -> str:
@@ -2372,9 +2409,8 @@ def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
         )
         stats.agent_host_identity += identity_count
 
-    next_content, move_exec_count = MOVE_EXEC_GATE_RE.subn(
-        _move_exec_gate_sub, next_content
-    )
+    # 1.1.10：不再强制 move_exec；把旧版强制写法还原为官方门控（stats.move_exec 记还原数）。
+    next_content, move_exec_count = _restore_move_exec_gates(next_content)
     stats.move_exec += move_exec_count
 
     next_content, subagent_count = _apply_subagent_patches(next_content)
@@ -2535,9 +2571,7 @@ def remove_patch_from_content(content: str) -> Tuple[str, RemoveStats]:
         )
         stats.agent_host_identity += identity_count
 
-    next_content, move_exec_count = MOVE_EXEC_GATE_RESTORE_RE.subn(
-        _move_exec_gate_restore, next_content
-    )
+    next_content, move_exec_count = _restore_move_exec_gates(next_content)
     stats.move_exec += move_exec_count
 
     next_content, subagent_count = _remove_subagent_patches(next_content)
@@ -3456,23 +3490,23 @@ def install(layout: CursorLayout) -> int:
         before.managed_local_route_markers + _stats.managed_local_route,
         before.local_runtime_load_markers + _stats.local_runtime_load,
         before.agent_host_identity_markers + _stats.agent_host_identity,
-        before.move_exec_markers + _stats.move_exec,
         before.agent_host_enablement_markers + _stats.agent_host_enablement,
     )
-    stream_capable = before.stream_capable or any(stream_hits)
-    # 只要五类锚点各命中 ≥1 就算完整（保持「全有或全无」防半装挂起）。
-    # 不再要求精确 (1,1,1,1,2)：agentHost 在只有 desktop（无 glass）的安装上会是 1，
+    # 旧版强制 move_exec 的残留本身就说明这是一份 Stream 安装（正在被升级还原）。
+    stream_capable = before.stream_capable or any(stream_hits) or _stats.move_exec > 0
+    # 只要四类锚点各命中 ≥1 就算完整（保持「全有或全无」防半装挂起）。
+    # 不再要求精确 (1,1,1,2)：agentHost 在只有 desktop（无 glass）的安装上会是 1，
     # 不同 commit 的 chunk 拆分也可能让某类命中数漂移，硬相等会误杀合法安装。
+    # move_exec 门控 1.1.10 起保持官方值，不再是锚点。
     # Remote SSH 服务端没有 workbench，agentHost enablement 锚点由本机客户端提供，不在此要求。
-    required_hits = stream_hits[:4] if layout.is_remote_server else stream_hits
+    required_hits = stream_hits[:3] if layout.is_remote_server else stream_hits
     if stream_capable and not all(hit >= 1 for hit in required_hits):
         raise SandToolError(
             "当前 Cursor 未完整匹配 Sand Stream 规则（有锚点缺失，拒绝半装）："
             f"route={stream_hits[0]}, "
             f"runtimeLoad={stream_hits[1]}, "
             f"identity={stream_hits[2]}, "
-            f"moveExec={stream_hits[3]}, "
-            f"agentHost={stream_hits[4]}"
+            f"agentHost={stream_hits[3]}"
         )
 
     # 子代理组同样「全有或全无」：五类 agent-host 锚点要齐，且本地运行时必须真有
@@ -3522,6 +3556,7 @@ def install(layout: CursorLayout) -> int:
             or status.legacy_client_markers != 0
             or status.legacy_eligibility_markers != 0
             or status.legacy_subagent_markers != 0
+            or status.legacy_move_exec_forced
             or (stream_capable and not status.stream_mode_installed)
             or (stream_capable and subagent_total and not status.subagent_installed)
             or (stream_capable and subagent_total and not status.subagent_wake_installed)
@@ -3533,6 +3568,7 @@ def install(layout: CursorLayout) -> int:
                 f"streamMode={status.stream_mode_installed}, "
                 f"subagent={status.subagent_markers}/{len(SUBAGENT_MARKERS)}, "
                 f"wake={status.subagent_wake_markers}/{status.subagent_wake_anchors}, "
+                f"legacyMoveExec={status.move_exec_markers}, "
                 "remainingLegacy="
                 f"{status.legacy_client_markers + status.legacy_eligibility_markers + status.legacy_subagent_markers}"
             )
@@ -3633,6 +3669,14 @@ def collect_status_lines() -> List[Tuple[str, str]]:
     ]
     if status.stream_mode_installed:
         lines.append(("Stream 模式已启用", ANSI_GREEN))
+        if status.legacy_move_exec_forced:
+            lines.append(
+                (
+                    "检测到旧版强制 move_exec 补丁：每条消息首 token 会多等约 10 秒，"
+                    "且 Cursor Rules 不会生效；运行 install 升级即可去掉",
+                    ANSI_YELLOW,
+                )
+            )
         if status.subagent_installed:
             lines.append(("子代理（Task 工具）与 Multitask 模式已启用", ANSI_GREEN))
             if not status.subagent_wake_installed:

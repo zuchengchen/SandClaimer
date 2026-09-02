@@ -84,12 +84,13 @@ build.bat
 | 组 | 作用 | 落在哪 |
 |---|---|---|
 | 客户端身份 / 会员伪装 | Sand 身份、资格判定、会员/模型列表伪装 | 渲染层 + 扩展宿主 |
-| Stream 回路 | managed-local 路由、本地 runtime、agent-host sand 身份、move_exec | `cursor-agent-host` 等扩展 |
+| Stream 回路 | managed-local 路由、本地 runtime、agent-host sand 身份 | `cursor-agent-host` 等扩展 |
 | 子代理 | Task 工具、resume / summarize / 后台完成动作放行、Multitask / Plan 等模式放行、后台子代理完成唤醒 | agent-host 扩展 + 渲染层 |
 
 - 官方 managed-local 门控只放行 Agent 模式且拒绝 simulated 消息；「Start Multitasking」「Build in Parallel」都是 `mode=multitask` 的 simulated 消息，所以需要子代理组才能在 Sand 号上用 Multitask。
-- 子代理组是「全有或全无」：五类 agent-host 锚点与运行链就绪锚点（move_exec 执行器 / 子代理运行器 / Task 工具工厂）任一缺失就拒绝安装，避免注入一个永远失败的 Task 工具。
+- 子代理组是「全有或全无」：五类 agent-host 锚点与运行链就绪锚点（cursor-agent-exec 共享运行时 / 子代理运行器 / Task 工具工厂）任一缺失就拒绝安装，避免注入一个永远失败的 Task 工具。
 - 兼容 Sand Stream Toolkit 1.2.x 打过的安装：旧 marker（`ACTION_ROUTE_V1`、`TASK_TOOL_V1`）会被识别并原地升级，状态栏提示「旧版，运行 install 升级」。
+- **1.1.10 起不再强制 `move_exec`**（`cursor_agent_host_move_exec` 门控保持官方值）。1.1.4–1.1.9 把它强制为开，agent-host 便不再激活 `cursor-agent-exec` 运行时，而它是唯一向 workbench 推送 Cursor Rules / Agent Skills / 自定义子代理的组件；workbench 每条消息都要等这份推送，等不到就 10 秒超时——表现为**每条消息首 token 固定多等约 10 秒**（`requestTraces` 中 `buildFromPushedData=10006ms`），且 `.cursor/rules`、User Rules 从不进 prompt。旧安装重跑一次 `install` 即可去掉（状态栏会提示「旧版 move_exec 强制仍在」）。
 
 ### Remote SSH 服务端
 

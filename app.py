@@ -516,6 +516,8 @@ class Api:
                 "streamCapable": bool(st.stream_capable),
                 "subagent": bool(st.subagent_installed and st.subagent_wake_installed),
                 "subagentLegacy": bool(st.legacy_subagent_markers),
+                # ≤1.1.9 强制 move_exec 的残留：每条消息首 token 多等约 10 秒，重打即可去掉。
+                "moveExecLegacy": bool(st.legacy_move_exec_forced),
                 "client": st.client_markers + st.legacy_client_markers,
                 "eligibility": st.eligibility_markers + st.legacy_eligibility_markers,
             }
