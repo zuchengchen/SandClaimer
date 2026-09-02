@@ -1,0 +1,6 @@
+# Linux runtime dependencies. GTK/WebKitGTK is supplied by the distribution;
+# install-linux.sh checks it and installs a Qt WebEngine fallback when needed.
+pywebview>=6.0,<7
+requests>=2.28,<3
+websocket-client>=1.6,<2
+QtPy>=2.4,<3

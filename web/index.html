@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sand 资格领取器</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="aurora" aria-hidden="true">
+    <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span>
+  </div>
+
+  <main>
+    <header class="glass hero">
+      <div class="hero-title">
+        <div class="logo">S</div>
+        <div>
+          <h1>Sand 资格领取器</h1>
+          <p class="sub">Grok Bot（Sand）批量领取 · 自动识别 access_token / ws token · 支持导入 JSON</p>
+          <p class="current-account" id="currentAccountHint" aria-live="polite">当前 Cursor：检测中…</p>
+        </div>
+      </div>
+      <div class="hero-stats">
+        <div class="stat"><b id="statTotal">0</b><span>账号</span></div>
+        <div class="stat"><b id="statDone">0</b><span>已开通</span></div>
+        <div class="stat"><b id="statCard">0</b><span>需绑卡</span></div>
+      </div>
+    </header>
+
+    <div class="notice glass" role="note">
+      <span class="notice-tag">公益免费</span>
+      <span>本工具<b>完全免费、纯公益分享</b>，仅供学习交流，严禁任何形式的倒卖或收费。若你是<b>花钱购买</b>得到的，说明已被他人倒卖——作者从不收费，请立即向卖家<b>申请全额退款</b>，并留意文件是否被篡改植入后门。</span>
+    </div>
+
+    <section class="glass card" id="patchCard">
+      <div class="card-head">
+        <h2>本机 Cursor 补丁 <span class="pill idle" id="patchPill">检测中…</span></h2>
+        <div class="actions">
+          <button class="btn primary" id="btnPatch">打补丁</button>
+          <button class="btn ghost" id="btnRestore">回退</button>
+        </div>
+      </div>
+      <p class="hint" id="patchInfo">正在检测本机 Cursor 安装…</p>
+      <div class="row-actions">
+        <input type="text" id="cursorPathInput" spellcheck="false"
+          placeholder="自定义 Cursor 路径（如 /usr/share/cursor、Cursor.exe 或 resources/app），留空=自动检测" />
+        <button class="btn" id="btnSetPath">设置路径</button>
+      </div>
+    </section>
+
+    <section class="glass card">
+      <div class="card-head">
+        <h2>导入账号</h2>
+        <div class="actions">
+          <button class="btn primary" id="btnDetectLocal">探测本机账号</button>
+          <button class="btn" id="btnImportFile">导入文件</button>
+          <button class="btn ghost" id="btnClear">清空</button>
+        </div>
+      </div>
+      <textarea id="tokenInput" spellcheck="false"
+        placeholder="粘贴 token，每行一个，支持：&#10;邮箱----user_01XXXX::eyJ...&#10;user_01XXXX::eyJ... 或裸 JWT&#10;也可直接粘贴 JSON / 点「导入文件」。"></textarea>
+      <div class="row-actions">
+        <button class="btn primary" id="btnAddText">添加到列表</button>
+        <span class="hint" id="importHint">支持批量：一次粘贴多行 / 选多个 JSON 文件。</span>
+      </div>
+    </section>
+
+    <section class="glass card">
+      <div class="card-head">
+        <h2>账号列表 <span class="pill idle" id="countPill">0 个</span></h2>
+        <div class="actions">
+          <label class="conc" title="切号时同时重置本机机器码，防止多个小号被 Cursor 关联">
+            <input type="checkbox" id="resetMidChk" /> 切号重置机器码
+          </label>
+          <label class="conc">并发
+            <input type="number" id="concInput" min="1" max="10" value="3" />
+          </label>
+          <label class="conc" title="每隔 1 分钟静默重新查询所有账号的 Bot 周用量，不打断当前操作">
+            <input type="checkbox" id="autoRefreshChk" checked /> 自动刷新周用量
+            <span class="hint" id="autoRefreshHint"></span>
+          </label>
+          <button class="btn" id="btnRefresh">刷新状态</button>
+          <button class="btn" id="btnExport" title="全部导出为 txt：Pro / Pro+ / Ultra 分段，不重复">导出全部</button>
+          <button class="btn primary" id="btnClaimAll">批量领取</button>
+        </div>
+      </div>
+      <div class="progress-wrap" id="progressWrap" hidden>
+        <div class="progress"><i id="progressBar"></i></div>
+        <span class="hint" id="progressText"></span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th class="col-chk"><input type="checkbox" id="chkAll" title="全选/取消" /></th>
+              <th>账号 / 邮箱</th>
+              <th>套餐</th>
+              <th>订阅到期</th>
+              <th>Sand 状态</th>
+              <th>额度</th>
+              <th class="col-act">操作</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <p class="empty" id="emptyHint">还没有账号。粘贴 token 或导入 JSON 后点「添加到列表」。</p>
+      </div>
+    </section>
+
+    <p class="foot">仅本机直连 Cursor 官方接口领取；token 不上传第三方。付费账号（Pro+/Ultra/Team）免绑卡，免费账号需验证信用卡。</p>
+  </main>
+
+  <div class="modal-mask" id="helpMask" hidden>
+    <div class="modal glass">
+      <h2>使用说明</h2>
+      <div class="modal-body">
+        <p><b>公益免费声明</b></p>
+        <p>本工具完全免费、纯公益分享，仅供学习交流，严禁倒卖或收费。若你是<b>付费购买</b>得到的，请立即向卖家<b>申请退款</b>——作者从不收费，付费即被倒卖，并注意甄别文件是否被篡改。</p>
+        <p><b>领取规则（按套餐区分）</b></p>
+        <ul>
+          <li><b>免费 Free 账号</b>：领取 Sand 需要<b>自行手动绑定信用卡</b>。点该账号那一行的<b>「网页领取」</b>，会用它的登录态打开浏览器直接到领取页，你在浏览器里完成绑卡即可。</li>
+          <li><b>Pro / Pro+ / Ultra / Team 账号</b>：<b>无需绑卡</b>，直接点「领取」或「批量领取」即可开通。</li>
+        </ul>
+        <p><b>常用操作</b></p>
+        <ul>
+          <li><b>导入账号</b>：粘贴 access_token / ws token（每行一个），或「导入文件」选 cursor_accounts_*.json。账号与状态都会自动保存，下次打开无需重导。</li>
+          <li><b>批量领取</b>：可设「并发」数并行领取；<b>勾选</b>部分账号则只处理勾选的，不勾则处理全部。</li>
+          <li><b>刷新状态</b>：查询每个账号的套餐、Sand 状态与额度。</li>
+          <li><b>自动刷新周用量</b>：勾选后每隔 1 分钟在后台静默重新查询所有账号的 Bot 周用量并更新列表（批量领取/刷新进行中会自动跳过）；取消勾选即停止，设置会记住。</li>
+          <li><b>两个账号</b>：每行的「Bot 周用量」对应该行账号；顶部「当前 Cursor」和行内蓝色标记表示桌面客户端正在使用的账号。身份以 access token 的 user id 为准，不要以旧邮箱缓存判断。切号后重新点「探测本机账号」即可复核。</li>
+          <li><b>本机 Cursor 补丁</b>：给本机 Cursor 打 / 回退 Sand 客户端模式补丁。</li>
+        </ul>
+      </div>
+      <label class="modal-check"><input type="checkbox" id="helpHide" /> 不再显示</label>
+      <div class="modal-actions"><button class="btn primary" id="helpOk">知道了</button></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

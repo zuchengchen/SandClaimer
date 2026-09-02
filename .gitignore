@@ -1,0 +1,6 @@
+.venv-linux/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# stale Windows-path artifacts
+web\\*
