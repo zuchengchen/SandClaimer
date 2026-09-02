@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 
-TOOL_VERSION = "1.1.10"
+TOOL_VERSION = "1.1.11"
 CONFIG_VERSION = 1
 
 SAND_CLIENT_MARKER = "/*SAND_CLIENT_MODE_V1*/"
@@ -103,10 +103,23 @@ SAND_SUBAGENT_ROUTE_MARKER = "/*SAND_MANAGED_SUBAGENT_ROUTE_V1*/"
 SAND_ACTION_ROUTE_MARKER = "/*SAND_MANAGED_ACTION_ROUTE_V2*/"
 SAND_ACTION_ROUTE_V1_MARKER = "/*SAND_MANAGED_ACTION_ROUTE_V1*/"
 SAND_SUBAGENT_SESSION_MARKER = "/*SAND_MANAGED_SUBAGENT_SESSION_V1*/"
-SAND_TASK_TOOL_MARKER = "/*SAND_MANAGED_TASK_TOOL_V2*/"
+# V3（1.1.11）：子代理模型改为沿用父请求的 requestedModel.modelId。V2 及更早把 createAgentConfig
+# 里解析后的复合 slug（形如 claude-fable-5-1-thinking-max，thinking / max 已拼进名字）当成
+# 子代理的 requestedModel.modelId，而服务端只认基础 ID（claude-fable-5-1，thinking / effort /
+# max 走 parameters 与 maxMode），子代理一启动就 ERROR_BAD_MODEL_NAME「Unknown model ID」。
+SAND_TASK_TOOL_MARKER = "/*SAND_MANAGED_TASK_TOOL_V3*/"
+# 1.1.x ≤ 1.1.10 与 Sand Stream Toolkit 1.2.6 写入的 V2 形态：升级时识别并替换为 V3。
+SAND_TASK_TOOL_V2_MARKER = "/*SAND_MANAGED_TASK_TOOL_V2*/"
 # Sand Stream Toolkit 1.2.4/1.2.5 写入的旧 taskToolProps 形态（无 subagentTypeName 短路、
-# 空 modelsBySlug），升级时识别并替换为 V2，卸载时同样还原。
+# 空 modelsBySlug），升级时识别并替换，卸载时同样还原。
 SAND_TASK_TOOL_V1_MARKER = "/*SAND_MANAGED_TASK_TOOL_V1*/"
+# 其他 Sand 工具对同一 taskToolProps 锚点的注入（如 Toolkit 的 SAND_SUBAGENT_TASK_PROPS_V2，
+# 形如 `taskToolProps:SAND_CHILD?void 0:/*SAND_SUBAGENT_TASK_PROPS_V2*/{...}`）。它已经用
+# requestedModel.modelId，本工具遇到时不再叠加注入，并把它视为 Task 工具槽位已满足；
+# 卸载时也不触碰它。`[^{}]` 保证只在锚点到对象开头之间查找，不会越过官方原文 `void 0}`。
+FOREIGN_TASK_TOOL_PROPS_RE = re.compile(
+    r"taskToolProps:[^{}]{0,120}?/\*SAND_(?!MANAGED_TASK_TOOL_V\d)[A-Z_0-9]+\*/\{"
+)
 # 渲染层（workbench desktop/glass）：后台子代理完成后唤醒父对话。官方只在
 # long_running_jobs 门控开启时才派发 source==="subagent" 的完成事件，Sand 号门控关着，
 # run_in_background 的子代理做完了父代理也收不到通知。Remote SSH 服务端没有渲染层，
@@ -124,6 +137,7 @@ SUBAGENT_MARKERS: Tuple[str, ...] = (
 LEGACY_SUBAGENT_MARKERS: Tuple[str, ...] = (
     SAND_ACTION_ROUTE_V1_MARKER,
     SAND_TASK_TOOL_V1_MARKER,
+    SAND_TASK_TOOL_V2_MARKER,
 )
 # 子代理运行链就绪锚点：这些是 Cursor 本地运行时里稳定的日志/工厂字面量，缺任何一个都说明
 # 当前构建没有对应代码路径，此时注入 taskToolProps 只会得到一个永远失败的 Task 工具。
@@ -408,6 +422,9 @@ class PatchStatus:
     subagent_wake_markers: int = 0
     # 渲染层里存在多少处唤醒锚点（原始或已打补丁）；服务端布局为 0。
     subagent_wake_anchors: int = 0
+    # 本工具的 Task 工具注入数（已含在 subagent_markers 里）与其他 Sand 工具的 Task 工具注入数。
+    task_tool_markers: int = 0
+    foreign_task_tool_markers: int = 0
 
     @property
     def installed(self) -> bool:
@@ -429,8 +446,15 @@ class PatchStatus:
         )
 
     @property
+    def task_tool_from_foreign(self) -> bool:
+        """Task 工具配置由其他 Sand 工具提供（本工具不注入、不卸载）。"""
+        return self.task_tool_markers == 0 and self.foreign_task_tool_markers > 0
+
+    @property
     def subagent_installed(self) -> bool:
-        return self.subagent_markers >= len(SUBAGENT_MARKERS)
+        # Task 工具槽位可由本工具 V3 或其他 Sand 工具的注入满足。
+        effective = self.subagent_markers + (1 if self.task_tool_from_foreign else 0)
+        return effective >= len(SUBAGENT_MARKERS)
 
     @property
     def subagent_wake_installed(self) -> bool:
@@ -768,7 +792,9 @@ def _subagent_session_sub(match: "re.Match[str]") -> str:
 
 
 # 5e) taskToolProps：从 void 0 变为可用配置，模型才拿得到 Task 工具。
-#     父模型名/参数/max 取自同一 createAgentConfig 闭包里的 e / i / l。
+#     请求 / 解析后模型 / max 取自同一 createAgentConfig 闭包里的 e / i / l。注意 i 是
+#     e.resolvedModel.modelId——UI 展示用的复合 slug（claude-fable-5-1-thinking-max），线上协议的
+#     requestedModel.modelId 则是基础 ID（claude-fable-5-1）。子代理必须沿用后者，见 V3 模板。
 TASK_TOOL_ANCHOR_RE = re.compile(
     r"(generateImage:\w+\(\w+,\{modelId:(\w+),maxMode:(\w+)\}\),"
     r"generateImageSuspiciousKeywords:\[\],imageGenerationConcurrencyLimiter:\w+\(\d+\),"
@@ -777,41 +803,107 @@ TASK_TOOL_ANCHOR_RE = re.compile(
 TASK_TOOL_CONFIG_FN_RE = re.compile(
     r"createAgentConfig:\w+=>function\((\w+),\w+\)\{var [\w,]+;const \w+=\1\.resolvedModelMetadata"
 )
-# 匹配任一已知形态的注入：V2（本工具 / Toolkit 1.2.6）、V1（Toolkit 1.2.4/1.2.5：可能没有
+# 旧版（V1 / V2）注入体：V2（≤1.1.10 / Toolkit 1.2.6）、V1（Toolkit 1.2.4/1.2.5：可能没有
 # subagentTypeName 短路、modelsBySlug 为空 Map、normalizeCustomSubagents 为 e=>e）。
-TASK_TOOL_RESTORE_RE = re.compile(
-    r"(isGenerateImageModelRestricted:!1,taskToolProps:)"
-    r"(?:void 0!==\w+\.runOptions\.subagentTypeName\?void 0:)?\{"
+# 末尾的 \} 只闭合配置对象本身，供下面三条正则共用。
+_TASK_TOOL_LEGACY_BODY = (
     r"/\*SAND_MANAGED_TASK_TOOL_V[12]\*/"
     r"parentRequestedModelName:\w+,parentModelParameters:\w+\.requestedModel\.parameters,"
     r"parentMaxMode:\w+,isModelBlocked:\(\)=>!1,isModelValid:\w+=>\w+===\w+,"
     r'requiresMaxMode:\(\)=>!1,compareModelCosts:\(\)=>0,subagentModelForcePolicy:"none",'
     r"requireServerSideSubagent:!1,"
     r"subagentModels:\{modelsBySlug:new Map(?:\(\[\[\w+,\{slug:\w+\}\]\]\))?\},"
-    r"normalizeCustomSubagents:(?:\(\)=>\[\]|\w+=>\w+),getTaskToolConfig:async\(\)=>\(\{\}\)\}\}"
+    r"normalizeCustomSubagents:(?:\(\)=>\[\]|\w+=>\w+),getTaskToolConfig:async\(\)=>\(\{\}\)\}"
+)
+# 完整的旧版注入（锚点处），还原为官方原文 `taskToolProps:void 0}`。
+TASK_TOOL_LEGACY_RESTORE_RE = re.compile(
+    r"(isGenerateImageModelRestricted:!1,taskToolProps:)"
+    r"(?:void 0!==\w+\.runOptions\.subagentTypeName\?void 0:)?\{"
+    + _TASK_TOOL_LEGACY_BODY
+    + r"\}"
+)
+# 被其他工具截断后的旧版残尾。Toolkit 的注入正则把旧版注入开头的 `taskToolProps:void 0` 当成
+# 官方原文替换成了自己的 `SAND_CHILD?void 0:{...}`，留下
+#   `{Toolkit 对象}!==e.runOptions.subagentTypeName?void 0:{/*V2*/...}`
+# 三元表达式因此恒为 void 0——父对话拿不到任何 Task 工具配置。install / uninstall 都先摘掉它。
+TASK_TOOL_DANGLING_RE = re.compile(
+    r"!==\w+\.runOptions\.subagentTypeName\?void 0:\{" + _TASK_TOOL_LEGACY_BODY
+)
+# V3 注入：子代理模型沿用父请求的 requestedModel.modelId（服务端认的基础 ID），thinking /
+# effort / max 仍由 parentModelParameters / parentMaxMode 单独携带；解析后的复合 slug 只作兜底。
+# 以 `null!=` 开头而不是 `void 0!==`，避免其他工具的 `taskToolProps:void 0` 前缀匹配再次把它截断。
+# 占位符：@REQ@ 请求变量、@MODEL@ 解析后的模型变量、@MAX@ maxMode 变量（均为 minified 名）。
+_TASK_TOOL_PARENT_MODEL_VAR = "__sandParentModel"
+_TASK_TOOL_V3_TEMPLATE = (
+    "null!=@REQ@.runOptions.subagentTypeName?void 0:("
+    + _TASK_TOOL_PARENT_MODEL_VAR
+    + "=>({"
+    + SAND_TASK_TOOL_MARKER
+    + "parentRequestedModelName:" + _TASK_TOOL_PARENT_MODEL_VAR + ","
+    "parentModelParameters:@REQ@.requestedModel.parameters,"
+    "parentMaxMode:@MAX@,"
+    "isModelBlocked:()=>!1,"
+    "isModelValid:e=>e===" + _TASK_TOOL_PARENT_MODEL_VAR + ","
+    "requiresMaxMode:()=>!1,"
+    "compareModelCosts:()=>0,"
+    'subagentModelForcePolicy:"none",'
+    "requireServerSideSubagent:!1,"
+    "subagentModels:{modelsBySlug:new Map([["
+    + _TASK_TOOL_PARENT_MODEL_VAR + ",{slug:" + _TASK_TOOL_PARENT_MODEL_VAR + "}]])},"
+    "normalizeCustomSubagents:()=>[],"
+    "getTaskToolConfig:async()=>({})}))(@REQ@.requestedModel.modelId||@MODEL@)}"
+)
+_TASK_TOOL_V3_PLACEHOLDERS = ("@REQ@", "@MODEL@", "@MAX@")
+
+
+def _template_regex(template: str, placeholders: Iterable[str], token: str = r"[\w$]+") -> str:
+    """把字面量模板转成正则：占位符位置放 token，其余逐字转义。"""
+    names = tuple(placeholders)
+    splitter = re.compile("|".join(re.escape(name) for name in names))
+    parts: List[str] = []
+    pos = 0
+    for match in splitter.finditer(template):
+        parts.append(re.escape(template[pos : match.start()]))
+        parts.append(token)
+        pos = match.end()
+    parts.append(re.escape(template[pos:]))
+    return "".join(parts)
+
+
+# 模板末尾的 "}" 同时闭合外层 tools:{...}，还原时统一写回 `\1void 0}`。
+TASK_TOOL_V3_RESTORE_RE = re.compile(
+    r"(isGenerateImageModelRestricted:!1,taskToolProps:)"
+    + _template_regex(_TASK_TOOL_V3_TEMPLATE, _TASK_TOOL_V3_PLACEHOLDERS)
 )
 
 
 def _task_tool_props_js(req: str, model: str, max_mode: str) -> str:
     return (
-        f"void 0!=={req}.runOptions.subagentTypeName?void 0:{{"
-        + SAND_TASK_TOOL_MARKER
-        + f"parentRequestedModelName:{model},"
-        f"parentModelParameters:{req}.requestedModel.parameters,"
-        f"parentMaxMode:{max_mode},"
-        "isModelBlocked:()=>!1,"
-        f"isModelValid:e=>e==={model},"
-        "requiresMaxMode:()=>!1,"
-        "compareModelCosts:()=>0,"
-        'subagentModelForcePolicy:"none",'
-        "requireServerSideSubagent:!1,"
-        f"subagentModels:{{modelsBySlug:new Map([[{model},{{slug:{model}}}]])}},"
-        "normalizeCustomSubagents:()=>[],"
-        "getTaskToolConfig:async()=>({})}}"
+        _TASK_TOOL_V3_TEMPLATE.replace("@REQ@", req)
+        .replace("@MODEL@", model)
+        .replace("@MAX@", max_mode)
     )
 
 
+def _restore_task_tool_props(content: str) -> Tuple[str, int]:
+    """把本工具任一版本的 Task 工具注入还原为官方原文；其他工具的注入原样保留。
+
+    返回 (新内容, 处理数)。悬垂残尾单独摘除：它后面紧跟的是其他工具的注入，不能写回 void 0。
+    """
+    total = 0
+    content, n = TASK_TOOL_V3_RESTORE_RE.subn(r"\1void 0}", content)
+    total += n
+    content, n = TASK_TOOL_LEGACY_RESTORE_RE.subn(r"\1void 0}", content)
+    total += n
+    content, n = TASK_TOOL_DANGLING_RE.subn("", content)
+    total += n
+    return content, total
+
+
 def _apply_task_tool_props(content: str) -> Tuple[str, int]:
+    # 其他 Sand 工具已经提供了 Task 工具配置：不叠加，否则两段注入拼在一起整个表达式失效。
+    if FOREIGN_TASK_TOOL_PROPS_RE.search(content):
+        return content, 0
     match = TASK_TOOL_ANCHOR_RE.search(content)
     if match is None:
         return content, 0
@@ -821,7 +913,7 @@ def _apply_task_tool_props(content: str) -> Tuple[str, int]:
     if not fn_matches:
         return content, 0
     req = fn_matches[-1].group(1)
-    # _task_tool_props_js 末尾的 "}}" 已同时闭合配置对象与外层 tools:{...}。
+    # _task_tool_props_js 末尾的 "}" 闭合外层 tools:{...}（配置对象已在 IIFE 内闭合）。
     replacement = match.group(1) + _task_tool_props_js(req, match.group(2), match.group(3))
     return content[: match.start()] + replacement + content[match.end():], 1
 
@@ -879,9 +971,14 @@ def _apply_subagent_patches(content: str) -> Tuple[str, int]:
     total += n
     content, n = SUBAGENT_SESSION_RE.subn(_subagent_session_sub, content, count=1)
     total += n
-    # 旧形态（V1 / 其他工具写入的 V2）先还原再按当前规则重打，统一到唯一形态。
+    # 旧形态先还原再按当前规则重打，统一到唯一形态：完整的 V1 / V2 精确还原为官方原文
+    # （随后重打 V3 计为升级）；剩下的才是被其他工具截断的残尾，摘掉它让其他工具的注入
+    # 重新生效，单独计为一次修复。
     had_task_tool = SAND_TASK_TOOL_MARKER in content
-    content, _ = TASK_TOOL_RESTORE_RE.subn(r"\1void 0}", content)
+    content, _ = TASK_TOOL_LEGACY_RESTORE_RE.subn(r"\1void 0}", content)
+    content, n = TASK_TOOL_DANGLING_RE.subn("", content)
+    total += n
+    content, _ = TASK_TOOL_V3_RESTORE_RE.subn(r"\1void 0}", content)
     content, n = _apply_task_tool_props(content)
     total += 0 if had_task_tool else n
     return content, total
@@ -910,7 +1007,7 @@ def _remove_subagent_patches(content: str) -> Tuple[str, int]:
     if n:
         content = content.replace(SUBAGENT_SESSION_PATCH, "")
         total += n
-    content, n = TASK_TOOL_RESTORE_RE.subn(r"\1void 0}", content)
+    content, n = _restore_task_tool_props(content)
     total += n
     return content, total
 
@@ -2824,6 +2921,8 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
     legacy_subagent_markers = 0
     subagent_wake_markers = 0
     subagent_wake_anchors = 0
+    task_tool_markers = 0
+    foreign_task_tool_markers = 0
     ide_matches = 0
     external_sand_matches = 0
     external_marker_count = 0
@@ -2858,6 +2957,8 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         move_exec_count = _move_exec_marker_count(content)
         subagent_count = _subagent_marker_count(content)
         legacy_subagent_count = _legacy_subagent_marker_count(content)
+        task_tool_markers += content.count(SAND_TASK_TOOL_MARKER)
+        foreign_task_tool_markers += len(FOREIGN_TASK_TOOL_PROPS_RE.findall(content))
         wake_count = content.count(SAND_SUBAGENT_WAKE_MARKER)
         subagent_wake_anchors += _subagent_wake_anchor_count(content)
         legacy_client_count = len(
@@ -2937,6 +3038,8 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         legacy_subagent_markers=legacy_subagent_markers,
         subagent_wake_markers=subagent_wake_markers,
         subagent_wake_anchors=subagent_wake_anchors,
+        task_tool_markers=task_tool_markers,
+        foreign_task_tool_markers=foreign_task_tool_markers,
     )
 
 
@@ -3526,6 +3629,12 @@ def install(layout: CursorLayout) -> int:
             marker: sum(text.count(marker) for text in merged_contents)
             for marker in SUBAGENT_MARKERS
         }
+        # Task 工具槽位也可由其他 Sand 工具的注入满足（本工具此时不叠加注入）。
+        foreign_task_tool_hits = sum(
+            len(FOREIGN_TASK_TOOL_PROPS_RE.findall(text)) for text in merged_contents
+        )
+        if foreign_task_tool_hits and marker_hits.get(SAND_TASK_TOOL_MARKER) == 0:
+            marker_hits[SAND_TASK_TOOL_MARKER] = foreign_task_tool_hits
         missing_markers = [m for m, n in marker_hits.items() if n == 0]
         # 就绪锚点只看 agent-host 扩展：workbench 渲染包里也打包了同一份 agent 运行时代码，
         # 但 Task 工具实际在扩展宿主里执行，渲染包命中不代表运行链可用。
@@ -3679,6 +3788,21 @@ def collect_status_lines() -> List[Tuple[str, str]]:
             )
         if status.subagent_installed:
             lines.append(("子代理（Task 工具）与 Multitask 模式已启用", ANSI_GREEN))
+            if status.task_tool_from_foreign:
+                lines.append(
+                    (
+                        "Task 工具配置由其他 Sand 工具提供，本工具未叠加注入（卸载时也不会触碰）",
+                        ANSI_BLUE,
+                    )
+                )
+            if status.legacy_subagent_markers:
+                lines.append(
+                    (
+                        "检测到旧版子代理注入残留（与其他工具的注入拼在一起时 Task 工具配置会整体失效），"
+                        "运行 install 清理",
+                        ANSI_YELLOW,
+                    )
+                )
             if not status.subagent_wake_installed:
                 lines.append(
                     (
@@ -3691,7 +3815,8 @@ def collect_status_lines() -> List[Tuple[str, str]]:
         elif status.legacy_subagent_markers:
             lines.append(
                 (
-                    "子代理补丁为旧版（仅 Agent 模式），运行 install 升级以支持 Multitask 模式",
+                    "子代理补丁为旧版（子代理会带着 -thinking/-max 复合模型名请求，"
+                    "启动即报 Unknown model ID），运行 install 升级",
                     ANSI_YELLOW,
                 )
             )

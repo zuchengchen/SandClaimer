@@ -89,7 +89,9 @@ build.bat
 
 - 官方 managed-local 门控只放行 Agent 模式且拒绝 simulated 消息；「Start Multitasking」「Build in Parallel」都是 `mode=multitask` 的 simulated 消息，所以需要子代理组才能在 Sand 号上用 Multitask。
 - 子代理组是「全有或全无」：五类 agent-host 锚点与运行链就绪锚点（cursor-agent-exec 共享运行时 / 子代理运行器 / Task 工具工厂）任一缺失就拒绝安装，避免注入一个永远失败的 Task 工具。
-- 兼容 Sand Stream Toolkit 1.2.x 打过的安装：旧 marker（`ACTION_ROUTE_V1`、`TASK_TOOL_V1`）会被识别并原地升级，状态栏提示「旧版，运行 install 升级」。
+- 兼容 Sand Stream Toolkit 1.2.x 打过的安装：旧 marker（`ACTION_ROUTE_V1`、`TASK_TOOL_V1`、`TASK_TOOL_V2`）会被识别并原地升级，状态栏提示「旧版，运行 install 升级」。
+- **1.1.11 修复子代理模型 ID**（`TASK_TOOL_V3`）。≤1.1.10 把 `createAgentConfig` 里解析后的复合 slug（如 `claude-fable-5-1-thinking-max`，thinking / max 已拼进名字）当成子代理的 `requestedModel.modelId`，而服务端只认基础 ID（`claude-fable-5-1`，thinking / effort / max 走 `parameters` 与 `maxMode`）——子代理一启动就 `ERROR_BAD_MODEL_NAME`「AI Model Not Found: Unknown model ID: claude-fable-5-1-thinking-max」，Multitask 全部失败而主对话正常。V3 改为沿用父请求的 `requestedModel.modelId`。重跑一次 `install` 升级，重启 Cursor 后 Agent Host 日志里子代理那条「Selected Agent Host turn runtime」的 `modelId` 应与父对话一致。
+- 与其他 Sand 工具共存：若 `taskToolProps` 锚点已被其他工具注入（如 Toolkit 的 `SAND_SUBAGENT_TASK_PROPS_V2`，它同样使用 `requestedModel.modelId`），本工具不再叠加注入、卸载时也不触碰它，状态栏提示「Task 工具配置由其他 Sand 工具提供」。此前两段注入若被拼接在一起（Toolkit 把本工具旧版注入开头的 `taskToolProps:void 0` 当成官方原文替换，留下 `!==e.runOptions.subagentTypeName?void 0:{...}` 残尾），整个表达式会恒为 `void 0`，父对话拿不到任何 Task 工具配置；`install` / `uninstall` 会先把这段残尾摘掉。
 - **1.1.10 起不再强制 `move_exec`**（`cursor_agent_host_move_exec` 门控保持官方值）。1.1.4–1.1.9 把它强制为开，agent-host 便不再激活 `cursor-agent-exec` 运行时，而它是唯一向 workbench 推送 Cursor Rules / Agent Skills / 自定义子代理的组件；workbench 每条消息都要等这份推送，等不到就 10 秒超时——表现为**每条消息首 token 固定多等约 10 秒**（`requestTraces` 中 `buildFromPushedData=10006ms`），且 `.cursor/rules`、User Rules 从不进 prompt。旧安装重跑一次 `install` 即可去掉（状态栏会提示「旧版 move_exec 强制仍在」）。
 
 ### Remote SSH 服务端

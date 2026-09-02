@@ -899,7 +899,7 @@ async function refreshPatch() {
       streamHint += res.subagent
         ? " · 子代理/Multitask 已启用"
         : res.subagentLegacy
-          ? " · 子代理补丁为旧版，重打可启用 Multitask"
+          ? " · ⚠ 子代理补丁为旧版（子代理会报 Unknown model ID），重打可修复"
           : " · 子代理未启用，重打可补齐";
       if (res.moveExecLegacy) {
         // ≤1.1.9 强制 move_exec：每条消息首 token 固定多等 ~10 秒，Rules 也不生效。
