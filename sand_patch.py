@@ -3,7 +3,7 @@
 规则分组：
   - 客户端身份 / 资格 / 会员伪装（渲染层与扩展宿主）
   - Stream 回路：managed-local 路由 + 本地 runtime + agent-host sand 身份
-    （move_exec 门控保持官方值；1.1.9 及更早版本强制开启的写法会在 install 时还原）
+    （move_exec 与 managed-local 配套强制开启；旧版 marker 会在 install 时升级）
   - 子代理：Task 工具、resume/summarize/后台完成动作放行、Multitask 等模式放行（agent-host）
     与后台子代理完成唤醒（渲染层）
 支持桌面版与 Remote SSH 服务端（~/.cursor-server/bin/<os>/<commit>，无渲染层）两种布局。
@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 
-TOOL_VERSION = "1.1.11"
+TOOL_VERSION = "1.1.12"
 CONFIG_VERSION = 1
 
 SAND_CLIENT_MARKER = "/*SAND_CLIENT_MODE_V1*/"
@@ -82,9 +82,9 @@ SAND_AGENT_HOST_IDENTITY_MARKER = "/*SAND_AGENT_HOST_IDENTITY_V1*/"
 SAND_AGENTEXEC_KEEP_MARKER = "/*SAND_AGENTEXEC_KEEP_V1*/"
 SAND_AGENT_IDE_MARKER = "/*SAND_AGENT_IDE_V1*/"
 SAND_STREAM_HOOK_MARKER = "/*SAND_STREAM_HOOK_V1*/"
-# 1.1.9 及更早版本把 cursor_agent_host_move_exec 门控强制为真（marker 见下）。1.1.10 起不再
-# 强制：这两个 marker 都视为「旧版残留」，install / uninstall 时按 marker 还原为官方原文。
-# 原因见下文 4) 的说明（强制 move_exec 会让每条消息首 token 固定多等 10 秒）。
+# 1.1.9 及更早版本把 cursor_agent_host_move_exec 门控强制为真（marker 见下）。1.1.10
+# 将它还原为官方门控后，实际运行中 managed-local 与 cursor-agent-exec 的资源拓扑不匹配，
+# shell/read/glob 会拿到 undefined provider 并报 undefined.execute；1.1.12 恢复强制开启。
 SAND_MOVE_EXEC_MARKER = "/*SAND_MOVE_EXEC_V1*/"
 # 1.1.8 之前的 Stream 安装器使用过这个标记名，且直接丢弃了原门控表达式。
 LEGACY_MOVE_EXEC_MARKERS: Tuple[str, ...] = (
@@ -142,13 +142,15 @@ LEGACY_SUBAGENT_MARKERS: Tuple[str, ...] = (
 # 子代理运行链就绪锚点：这些是 Cursor 本地运行时里稳定的日志/工厂字面量，缺任何一个都说明
 # 当前构建没有对应代码路径，此时注入 taskToolProps 只会得到一个永远失败的 Task 工具。
 # 只在 cursor-agent-host 扩展目录内统计。
-# execRuntimeReady：move_exec 门控为官方值（OFF）时 host 走的分支——从 cursor-agent-exec 取共享
-# 运行时并激活它（该运行时同时负责向 workbench 推送 rules / skills / 子代理），工具执行器由它提供。
+# execRuntimeReady：兼容两种官方日志，但本工具默认使用 move_exec ON 的
+# @anysphere/agent-host-exec 资源拓扑；OFF 分支保留在正则中，便于识别旧安装。
 SUBAGENT_READY_ANCHORS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     (
         "execRuntimeReady",
         re.compile(
-            re.escape("Acquired shared agent runtime from cursor-agent-exec")
+            re.escape("move_exec ON: using @anysphere/agent-host-exec for session resources")
+            + "|"
+            + re.escape("Acquired shared agent runtime from cursor-agent-exec")
         ),
     ),
     ("taskRunnerReady", re.compile(re.escape("Creating subagent and starting execution"))),
@@ -187,13 +189,13 @@ SAND_MEMBERSHIP_SNIPPET = (
 )
 
 # Stream 核心：managed-local + 本地 runtime + agent-host sand 身份
-# + 强制开启 agent host。move_exec 门控保持官方值（见下文 4)）。
+# + 强制开启 agent host 与 move_exec 执行器。
 # 1.1.1–1.1.3 曾把 hre() 短路成 Joe(raw client)，工具 get(CP._As) 落到 undefined.execute。
 # 1.1.3 曾删掉强制 host 后的 return（AGENTEXEC_KEEP），workbench 继续等 agent-exec。
 # 实测 14:11 日志：agent-exec 注册 30s+ 连超时，界面就是「超长时间」，
 # 最终 ERROR_EXTENSION_HOST_TIMEOUT。1.1.5 打补丁时剥掉残留 KEEP。
-# 1.1.4–1.1.9 仿 ThankCat 1.0.8 强制 move_exec 走同包 createAgentHostExec；1.1.10 发现它正是
-# 「每条消息首 token 多等 10 秒」的根因，改回官方门控。
+# 1.1.4–1.1.9 仿 ThankCat 1.0.8 强制 move_exec 走同包 createAgentHostExec；1.1.10
+# 改回官方门控后暴露 undefined.execute，1.1.12 恢复这条已验证的执行器路径。
 
 # 只往这两个 renderer 包注入会员伪装（有 fetch/window）。
 MEMBERSHIP_TARGET_NAMES = ("workbench.desktop.main.js", "workbench.glass.main.js")
@@ -415,6 +417,7 @@ class PatchStatus:
     agent_host_enablement_markers: int = 0
     agent_host_identity_markers: int = 0
     move_exec_markers: int = 0
+    legacy_move_exec_markers: int = 0
     stream_capable: bool = False
     remote_server: bool = False
     subagent_markers: int = 0
@@ -425,6 +428,8 @@ class PatchStatus:
     # 本工具的 Task 工具注入数（已含在 subagent_markers 里）与其他 Sand 工具的 Task 工具注入数。
     task_tool_markers: int = 0
     foreign_task_tool_markers: int = 0
+    # 其他工具对 hre() 的 direct-stream 注入数；该形态会让工具 executor 变成 undefined。
+    foreign_direct_stream_markers: int = 0
 
     @property
     def installed(self) -> bool:
@@ -439,6 +444,7 @@ class PatchStatus:
             + self.agent_host_enablement_markers
             + self.agent_host_identity_markers
             + self.move_exec_markers
+            + self.legacy_move_exec_markers
             + self.subagent_markers
             + self.legacy_subagent_markers
             + self.subagent_wake_markers
@@ -463,23 +469,24 @@ class PatchStatus:
 
     @property
     def stream_mode_installed(self) -> bool:
-        # 1.1.3 短路 createPromptSession 会让工具 get(CP._As) 落到 undefined.execute，
-        # 所以 direct_stream 必须为 0。move_exec 门控 1.1.10 起保持官方值，不再是必需锚点；
-        # 残留的强制写法由 legacy_move_exec_forced 单独提示。
+        # 任何 direct-stream 注入都会让工具 get(CP._As) 落到 undefined.execute；
+        # managed-local 还必须配套 move_exec ON 才有完整的资源执行器。
         # agent-host enablement 锚点在 workbench 渲染层；Remote SSH 服务端没有该文件，
-        # 由本机客户端那份 workbench 提供，服务端只校验扩展宿主侧三类锚点。
+        # 由本机客户端那份 workbench 提供，服务端只校验扩展宿主侧四类锚点。
         return (
             self.managed_local_route_markers > 0
             and self.local_runtime_load_markers > 0
             and self.direct_stream_markers == 0
             and (self.remote_server or self.agent_host_enablement_markers > 0)
             and self.agent_host_identity_markers > 0
+            and self.move_exec_markers > 0
+            and self.foreign_direct_stream_markers == 0
         )
 
     @property
     def legacy_move_exec_forced(self) -> bool:
-        """1.1.9 及更早版本强制开启 move_exec 的残留：每条消息首 token 多等约 10 秒。"""
-        return self.move_exec_markers > 0
+        """1.1.9 及更早版本 marker 的残留（当前版本 marker 不再算旧版）。"""
+        return self.legacy_move_exec_markers > 0
 
 
 def _compile_client_rules() -> Tuple[Tuple[str, re.Pattern[str]], ...]:
@@ -573,6 +580,14 @@ AGENT_HOST_IDENTITY_PATCHED = (
 DIRECT_STREAM_ANCHOR = (
     "function hre(e){return t=>{return n=this,o=void 0,s=function*(){"
 )
+# 其他版本的 Sand/Stream 工具可能把同一处 hre() 改成直接 new Joe(rawClient)。
+# 这种注入绕过官方 runInference 握手，工具资源 map 中的 execute 会为空。只识别
+# 带 direct/stream/transport 语义的外部 marker，避免把合法的其他 Sand 注入误报为冲突。
+FOREIGN_DIRECT_STREAM_MARKER_RE = re.compile(
+    r"/\*SAND_(?!DIRECT_INFERENCE_STREAM_V1\*/)"
+    r"(?=[A-Z0-9_]*(?:DIRECT|STREAM|TRANSPORT|RUN_LEVEL))"
+    r"[A-Z0-9_]+_V\d+\*/"
+)
 AGENT_HOST_ENABLEMENT_RE = re.compile(
     r"(this\._agentHostEnabled=)([A-Za-z_$][A-Za-z0-9_$]*)(,)"
 )
@@ -609,23 +624,34 @@ STREAM_HOOK_REMOVE_RE = re.compile(
     + re.escape(SAND_STREAM_HOOK_MARKER)
     + r';'
 )
-# 4) move_exec 网关（cursor_agent_host_move_exec）：保持官方值，不再强制为真。
-#    1.1.4–1.1.9 把它强制为 !0，让 host 用同包 createAgentHostExec 提供工具执行器。但 move_exec
-#    ON 时 host 不再激活 cursor-agent-exec 的运行时（日志：move_exec ON ... no cursor-agent-exec
-#    runtime），而只有该运行时会向 workbench 推送 Cursor Rules / Agent Skills / 自定义子代理
-#    （$updateCursorRules 等）。workbench 的 WorkbenchRequestContextExecutor.buildFromPushedData
-#    每条消息都要 await 推送来的 rules，peek 不到就等满 10s 超时——requestTraces 实测
-#    buildFromPushedData=10006ms、client.ttft≈10.7s，而 grok-4.6 真正的网络+模型首 token 只有
-#    1~2s；同时 rules/skills 从不进 prompt。门控为 OFF 时 host 走官方默认路径：
-#    createLiveExecRuntime 从 cursor-agent-exec 取共享运行时并激活，rules 正常推送，
-#    工具执行器由该运行时提供。
-#    这里只负责把旧版强制写法还原为官方原文（install 与 uninstall 共用）。
+# 4) move_exec 网关（cursor_agent_host_move_exec）：与强制 managed-local 配套开启。
+#    OFF 分支依赖 cursor-agent-exec 在启动时注册完整资源 provider；在 Cursor 3.18.9 的
+#    Sand 路径中该 provider 可能尚未注册，shell/read/glob 随后会执行 undefined.execute。
+#    ON 分支直接使用同包 createAgentHostExec，已验证能提供完整工具执行器。代价是某些构建
+#    的 Rules/Skills 推送会增加约 10 秒首 token 延迟，但功能优先于延迟。
 #    用稳定的 createAgentHost), 前缀锁定到唯一一处，绝不误伤同文件里另外两个同构 gate
 #    （native cloud subagent ownership / subagent interaction policy）。
 MOVE_EXEC_GATE_RE = re.compile(
     r"(createAgentHost\),)(\w+)=await Promise\.resolve\("
     r"(\w+\.cursor\.checkFeatureGate\(\w+\))\)\.catch\(\(\)=>!1\)"
 )
+
+
+def _move_exec_gate_sub(match: "re.Match[str]") -> str:
+    prefix = match.group(1)
+    var = match.group(2)
+    gate = match.group(3)
+    return (
+        prefix
+        + var
+        + "=!0"
+        + SAND_MOVE_EXEC_MARKER
+        + "||await Promise.resolve("
+        + gate
+        + ").catch(()=>!1)"
+    )
+
+
 # 1.1.8–1.1.9 写法：原 gate 读取以 !0||await... 死代码保留，可直接精确还原。
 MOVE_EXEC_GATE_RESTORE_RE = re.compile(
     r"(createAgentHost\),)(\w+)=!0"
@@ -652,9 +678,16 @@ def _move_exec_gate_restore(match: "re.Match[str]") -> str:
     return prefix + var + "=await Promise.resolve(" + gate + ").catch(()=>!1)"
 
 
-def _restore_move_exec_gates(content: str) -> Tuple[str, int]:
-    """把所有旧版强制 move_exec 的写法还原为官方门控读取。返回 (新内容, 还原数)。"""
-    content, total = MOVE_EXEC_GATE_RESTORE_RE.subn(_move_exec_gate_restore, content)
+def _restore_move_exec_gates(
+    content: str, *, restore_current: bool = True
+) -> Tuple[str, int]:
+    """还原旧版强制 move_exec 写法；install 可保留当前版本 marker 以保持幂等。"""
+    total = 0
+    if restore_current:
+        content, current_count = MOVE_EXEC_GATE_RESTORE_RE.subn(
+            _move_exec_gate_restore, content
+        )
+        total += current_count
     if not any(marker in content for marker in LEGACY_MOVE_EXEC_MARKERS):
         return content, total
     gate_match = MOVE_EXEC_GATE_NAME_RE.search(content)
@@ -673,6 +706,43 @@ def _restore_move_exec_gates(content: str) -> Tuple[str, int]:
 
     content, legacy_count = MOVE_EXEC_GATE_LEGACY_RE.subn(_legacy_restore, content)
     return content, total + legacy_count
+
+
+def _ensure_move_exec_gate(content: str) -> Tuple[str, int]:
+    """确保 managed-local 使用有完整工具执行器的 move_exec ON 拓扑。"""
+    # 先升级 1.1.8 之前的旧 marker；当前 marker 保留，避免重复 install 产生无意义变更。
+    content, restored = _restore_move_exec_gates(content, restore_current=False)
+    if SAND_MOVE_EXEC_MARKER in content:
+        return content, restored
+    content, forced = MOVE_EXEC_GATE_RE.subn(_move_exec_gate_sub, content, count=1)
+    return content, restored + forced
+
+
+def _foreign_direct_stream_marker_count(content: str) -> int:
+    """统计外部工具对 hre() 的 direct-stream 注入。
+
+    仅在 marker 位于 hre 函数、且同时出现 raw Joe 会话特征时计数；官方 hre() 本身
+    不满足这两个条件。这样不会把普通的 Fable/模型参数注入误判为工具链冲突。
+    """
+    start = content.find(DIRECT_STREAM_ANCHOR)
+    if start < 0:
+        return 0
+    end = content.find("function pre(", start, start + 12000)
+    if end < 0:
+        end = min(len(content), start + 12000)
+    segment = content[start:end]
+    matches = FOREIGN_DIRECT_STREAM_MARKER_RE.findall(segment)
+    if matches:
+        return len(matches)
+    if re.search(r"/\*SAND_DIRECT_INFERENCE_STREAM_V1\*/", segment):
+        # 这是本工具可识别、可在 install 时剥离的历史注入，不属于外部冲突。
+        return 0
+    if "const __sandDirect" not in segment:
+        return 0
+    if "new Joe(e,n,void 0,void 0).getSession()" not in segment:
+        return 0
+    # 即使外部工具没有给 marker 命名为 STREAM，也要把这个明确的 raw-client 形态报出来。
+    return 1
 
 
 # 5) 子代理组（agent-host dist 657/675 chunk）。所有规则均按 marker 精确还原，字节级可回退。
@@ -1142,8 +1212,13 @@ def _content_has_stream_anchors(content: str) -> bool:
 
 
 def _move_exec_marker_count(content: str) -> int:
-    """旧版（≤1.1.9）强制 move_exec 的残留 marker 数，含 1.1.8 之前的标记名。"""
-    return sum(content.count(marker) for marker in MOVE_EXEC_MARKERS)
+    """仅统计当前版本的 move_exec marker。"""
+    return content.count(SAND_MOVE_EXEC_MARKER)
+
+
+def _legacy_move_exec_marker_count(content: str) -> int:
+    """仅统计 1.1.8 及更早版本使用的 marker。"""
+    return sum(content.count(marker) for marker in LEGACY_MOVE_EXEC_MARKERS)
 
 
 def _platform_name() -> str:
@@ -2506,8 +2581,9 @@ def apply_patch_to_content(content: str) -> Tuple[str, PatchStats]:
         )
         stats.agent_host_identity += identity_count
 
-    # 1.1.10：不再强制 move_exec；把旧版强制写法还原为官方门控（stats.move_exec 记还原数）。
-    next_content, move_exec_count = _restore_move_exec_gates(next_content)
+    # 1.1.12：managed-local 必须配套 move_exec ON，使用完整的 agent-host-exec 资源执行器。
+    # 旧版 marker 先升级，当前 marker 保持不变以确保重复 install 幂等。
+    next_content, move_exec_count = _ensure_move_exec_gate(next_content)
     stats.move_exec += move_exec_count
 
     next_content, subagent_count = _apply_subagent_patches(next_content)
@@ -2915,6 +2991,7 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
     agent_host_enablement_markers = 0
     agent_host_identity_markers = 0
     move_exec_markers = 0
+    legacy_move_exec_markers = 0
     legacy_client_markers = 0
     legacy_eligibility_markers = 0
     subagent_markers = 0
@@ -2923,6 +3000,7 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
     subagent_wake_anchors = 0
     task_tool_markers = 0
     foreign_task_tool_markers = 0
+    foreign_direct_stream_markers = 0
     ide_matches = 0
     external_sand_matches = 0
     external_marker_count = 0
@@ -2955,10 +3033,12 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
             SAND_AGENT_HOST_IDENTITY_MARKER
         )
         move_exec_count = _move_exec_marker_count(content)
+        legacy_move_exec_count = _legacy_move_exec_marker_count(content)
         subagent_count = _subagent_marker_count(content)
         legacy_subagent_count = _legacy_subagent_marker_count(content)
         task_tool_markers += content.count(SAND_TASK_TOOL_MARKER)
         foreign_task_tool_markers += len(FOREIGN_TASK_TOOL_PROPS_RE.findall(content))
+        foreign_direct_stream_count = _foreign_direct_stream_marker_count(content)
         wake_count = content.count(SAND_SUBAGENT_WAKE_MARKER)
         subagent_wake_anchors += _subagent_wake_anchor_count(content)
         legacy_client_count = len(
@@ -2993,9 +3073,11 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
             + agent_host_enablement_count
             + agent_host_identity_count
             + move_exec_count
+            + legacy_move_exec_count
             + subagent_count
             + legacy_subagent_count
             + wake_count
+            + foreign_direct_stream_count
         ):
             patched_files.append(target)
         subagent_markers += subagent_count
@@ -3011,6 +3093,8 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         agent_host_enablement_markers += agent_host_enablement_count
         agent_host_identity_markers += agent_host_identity_count
         move_exec_markers += move_exec_count
+        legacy_move_exec_markers += legacy_move_exec_count
+        foreign_direct_stream_markers += foreign_direct_stream_count
         for _key, rule in CLIENT_RULES:
             for match in rule.finditer(content):
                 if match.group(3) == "sand":
@@ -3032,6 +3116,7 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         agent_host_enablement_markers=agent_host_enablement_markers,
         agent_host_identity_markers=agent_host_identity_markers,
         move_exec_markers=move_exec_markers,
+        legacy_move_exec_markers=legacy_move_exec_markers,
         stream_capable=stream_capable,
         remote_server=layout.is_remote_server,
         subagent_markers=subagent_markers,
@@ -3040,6 +3125,7 @@ def inspect_status(layout: CursorLayout) -> PatchStatus:
         subagent_wake_anchors=subagent_wake_anchors,
         task_tool_markers=task_tool_markers,
         foreign_task_tool_markers=foreign_task_tool_markers,
+        foreign_direct_stream_markers=foreign_direct_stream_markers,
     )
 
 
@@ -3514,6 +3600,8 @@ def _build_install_plan(
         total.agent_host_enablement += stats.agent_host_enablement
         total.agent_host_identity += stats.agent_host_identity
         total.move_exec += stats.move_exec
+        total.subagent += stats.subagent
+        total.subagent_wake += stats.subagent_wake
     if plan:
         _update_extension_hashes(layout, plan)
         _sync_product_checksums(layout, plan)
@@ -3544,6 +3632,8 @@ def _build_uninstall_plan(
         total.agent_host_enablement += stats.agent_host_enablement
         total.agent_host_identity += stats.agent_host_identity
         total.move_exec += stats.move_exec
+        total.subagent += stats.subagent
+        total.subagent_wake += stats.subagent_wake
     if plan:
         _update_extension_hashes(layout, plan)
         _sync_product_checksums(layout, plan)
@@ -3577,6 +3667,12 @@ def _mac_seal(layout: CursorLayout) -> None:
 
 def install(layout: CursorLayout) -> int:
     before = inspect_status(layout)
+    if before.foreign_direct_stream_markers:
+        raise SandToolError(
+            "检测到其他工具注入的 direct-stream 运行时代码（"
+            f"{before.foreign_direct_stream_markers} 处），它会导致 undefined.execute；"
+            "请先卸载该工具，或重新安装同版本 Cursor 恢复官方文件后再安装本补丁"
+        )
     if before.external_marker_count:
         raise SandToolError(
             "检测到其他 Sand 模式标记，本脚本不会接管或覆盖它；"
@@ -3593,23 +3689,24 @@ def install(layout: CursorLayout) -> int:
         before.managed_local_route_markers + _stats.managed_local_route,
         before.local_runtime_load_markers + _stats.local_runtime_load,
         before.agent_host_identity_markers + _stats.agent_host_identity,
+        before.move_exec_markers + _stats.move_exec,
         before.agent_host_enablement_markers + _stats.agent_host_enablement,
     )
-    # 旧版强制 move_exec 的残留本身就说明这是一份 Stream 安装（正在被升级还原）。
+    # move_exec marker 是当前 Stream 资源拓扑的必需锚点；旧版 marker 会在 apply 时升级。
     stream_capable = before.stream_capable or any(stream_hits) or _stats.move_exec > 0
-    # 只要四类锚点各命中 ≥1 就算完整（保持「全有或全无」防半装挂起）。
+    # 只要五类锚点各命中 ≥1 就算完整（保持「全有或全无」防半装挂起）。
     # 不再要求精确 (1,1,1,2)：agentHost 在只有 desktop（无 glass）的安装上会是 1，
     # 不同 commit 的 chunk 拆分也可能让某类命中数漂移，硬相等会误杀合法安装。
-    # move_exec 门控 1.1.10 起保持官方值，不再是锚点。
     # Remote SSH 服务端没有 workbench，agentHost enablement 锚点由本机客户端提供，不在此要求。
-    required_hits = stream_hits[:3] if layout.is_remote_server else stream_hits
+    required_hits = stream_hits[:4] if layout.is_remote_server else stream_hits
     if stream_capable and not all(hit >= 1 for hit in required_hits):
         raise SandToolError(
             "当前 Cursor 未完整匹配 Sand Stream 规则（有锚点缺失，拒绝半装）："
             f"route={stream_hits[0]}, "
             f"runtimeLoad={stream_hits[1]}, "
             f"identity={stream_hits[2]}, "
-            f"agentHost={stream_hits[3]}"
+            f"moveExec={stream_hits[3]}, "
+            f"agentHost={stream_hits[4]}"
         )
 
     # 子代理组同样「全有或全无」：五类 agent-host 锚点要齐，且本地运行时必须真有
@@ -3666,6 +3763,7 @@ def install(layout: CursorLayout) -> int:
             or status.legacy_eligibility_markers != 0
             or status.legacy_subagent_markers != 0
             or status.legacy_move_exec_forced
+            or status.foreign_direct_stream_markers != 0
             or (stream_capable and not status.stream_mode_installed)
             or (stream_capable and subagent_total and not status.subagent_installed)
             or (stream_capable and subagent_total and not status.subagent_wake_installed)
@@ -3677,7 +3775,7 @@ def install(layout: CursorLayout) -> int:
                 f"streamMode={status.stream_mode_installed}, "
                 f"subagent={status.subagent_markers}/{len(SUBAGENT_MARKERS)}, "
                 f"wake={status.subagent_wake_markers}/{status.subagent_wake_anchors}, "
-                f"legacyMoveExec={status.move_exec_markers}, "
+                f"moveExec={status.move_exec_markers}, "
                 "remainingLegacy="
                 f"{status.legacy_client_markers + status.legacy_eligibility_markers + status.legacy_subagent_markers}"
             )
@@ -3693,6 +3791,11 @@ def install(layout: CursorLayout) -> int:
 
 def uninstall(layout: CursorLayout) -> int:
     before = inspect_status(layout)
+    if before.foreign_direct_stream_markers:
+        raise SandToolError(
+            "检测到其他工具注入的 direct-stream 运行时代码，拒绝在混合状态下卸载；"
+            "请先卸载该工具，或重新安装同版本 Cursor 恢复官方文件"
+        )
     if before.external_marker_count:
         raise SandToolError(
             "检测到无法识别的 Sand 模式标记，拒绝修改；"
@@ -3708,11 +3811,16 @@ def uninstall(layout: CursorLayout) -> int:
 
     def validate() -> None:
         status = inspect_status(layout)
-        if status.installed or status.external_marker_count:
+        if (
+            status.installed
+            or status.external_marker_count
+            or status.foreign_direct_stream_markers
+        ):
             raise SandToolError(
                 "卸载后仍有 Sand marker："
                 f"{status.client_markers + status.eligibility_markers}，"
-                f"external={status.external_marker_count}"
+                f"external={status.external_marker_count}, "
+                f"foreignDirectStream={status.foreign_direct_stream_markers}"
             )
         _verify_extension_hashes(layout, changed_extensions)
         _verify_product_checksums(layout)
@@ -3776,6 +3884,14 @@ def collect_status_lines() -> List[Tuple[str, str]]:
     lines: List[Tuple[str, str]] = [
         (f"Cursor {layout.version}{kind}：{layout.install_root}", ANSI_BLUE)
     ]
+    if status.foreign_direct_stream_markers:
+        lines.append(
+            (
+                "检测到其他工具的 direct-stream 注入（会导致 undefined.execute），"
+                "请先卸载该工具或重装同版本 Cursor",
+                ANSI_RED,
+            )
+        )
     if status.stream_mode_installed:
         lines.append(("Stream 模式已启用", ANSI_GREEN))
         if status.legacy_move_exec_forced:

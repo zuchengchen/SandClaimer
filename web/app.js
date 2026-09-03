@@ -870,6 +870,15 @@ async function refreshPatch() {
     info.textContent = (res && res.error) || "未找到本机 Cursor 安装。";
     return;
   }
+  if (res.foreignDirectStream) {
+    pill.className = "pill bad";
+    pill.textContent = "补丁冲突";
+    info.textContent =
+      "检测到其他工具注入的 direct-stream 代码，会导致 Cursor 工具 execute 为空；" +
+      "请先卸载该工具或重装同版本 Cursor，再重新安装本补丁。 · " +
+      (res.path || "");
+    return;
+  }
   const versionMismatch = !res.streamMode && !res.streamCapable;
   if (res.streamMode) {
     pill.className = "pill ok";

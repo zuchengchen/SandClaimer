@@ -84,7 +84,7 @@ build.bat
 | 组 | 作用 | 落在哪 |
 |---|---|---|
 | 客户端身份 / 会员伪装 | Sand 身份、资格判定、会员/模型列表伪装 | 渲染层 + 扩展宿主 |
-| Stream 回路 | managed-local 路由、本地 runtime、agent-host sand 身份 | `cursor-agent-host` 等扩展 |
+| Stream 回路 | managed-local 路由、本地 runtime、agent-host sand 身份、move_exec 执行器 | `cursor-agent-host` 等扩展 |
 | 子代理 | Task 工具、resume / summarize / 后台完成动作放行、Multitask / Plan 等模式放行、后台子代理完成唤醒 | agent-host 扩展 + 渲染层 |
 
 - 官方 managed-local 门控只放行 Agent 模式且拒绝 simulated 消息；「Start Multitasking」「Build in Parallel」都是 `mode=multitask` 的 simulated 消息，所以需要子代理组才能在 Sand 号上用 Multitask。
@@ -92,7 +92,19 @@ build.bat
 - 兼容 Sand Stream Toolkit 1.2.x 打过的安装：旧 marker（`ACTION_ROUTE_V1`、`TASK_TOOL_V1`、`TASK_TOOL_V2`）会被识别并原地升级，状态栏提示「旧版，运行 install 升级」。
 - **1.1.11 修复子代理模型 ID**（`TASK_TOOL_V3`）。≤1.1.10 把 `createAgentConfig` 里解析后的复合 slug（如 `claude-fable-5-1-thinking-max`，thinking / max 已拼进名字）当成子代理的 `requestedModel.modelId`，而服务端只认基础 ID（`claude-fable-5-1`，thinking / effort / max 走 `parameters` 与 `maxMode`）——子代理一启动就 `ERROR_BAD_MODEL_NAME`「AI Model Not Found: Unknown model ID: claude-fable-5-1-thinking-max」，Multitask 全部失败而主对话正常。V3 改为沿用父请求的 `requestedModel.modelId`。重跑一次 `install` 升级，重启 Cursor 后 Agent Host 日志里子代理那条「Selected Agent Host turn runtime」的 `modelId` 应与父对话一致。
 - 与其他 Sand 工具共存：若 `taskToolProps` 锚点已被其他工具注入（如 Toolkit 的 `SAND_SUBAGENT_TASK_PROPS_V2`，它同样使用 `requestedModel.modelId`），本工具不再叠加注入、卸载时也不触碰它，状态栏提示「Task 工具配置由其他 Sand 工具提供」。此前两段注入若被拼接在一起（Toolkit 把本工具旧版注入开头的 `taskToolProps:void 0` 当成官方原文替换，留下 `!==e.runOptions.subagentTypeName?void 0:{...}` 残尾），整个表达式会恒为 `void 0`，父对话拿不到任何 Task 工具配置；`install` / `uninstall` 会先把这段残尾摘掉。
-- **1.1.10 起不再强制 `move_exec`**（`cursor_agent_host_move_exec` 门控保持官方值）。1.1.4–1.1.9 把它强制为开，agent-host 便不再激活 `cursor-agent-exec` 运行时，而它是唯一向 workbench 推送 Cursor Rules / Agent Skills / 自定义子代理的组件；workbench 每条消息都要等这份推送，等不到就 10 秒超时——表现为**每条消息首 token 固定多等约 10 秒**（`requestTraces` 中 `buildFromPushedData=10006ms`），且 `.cursor/rules`、User Rules 从不进 prompt。旧安装重跑一次 `install` 即可去掉（状态栏会提示「旧版 move_exec 强制仍在」）。
+- **1.1.12 恢复强制 `move_exec`**（`cursor_agent_host_move_exec` 门控）：1.1.10 将它还原为官方 OFF 后，managed-local 在 Cursor 3.18.9 上可能拿不到完整的执行资源，shell/read/glob 会报 `Cannot read properties of undefined (reading 'execute')`。现在使用同包 `@anysphere/agent-host-exec` 提供工具执行器，优先保证功能；部分构建可能重新出现约 10 秒的首 token 延迟。旧安装请重跑一次 `install`。
+- 安装器会拒绝检测到的外部 direct-stream 注入（例如 `SAND_RUN_LEVEL_TRANSPORT_V2`）。这类注入绕过官方 `runInference` 握手，无法通过本工具安全叠加修复；请先卸载产生它的工具，或重新安装同版本 Cursor 恢复官方文件，再运行 `install`。
+
+#### `undefined.execute` 恢复流程
+
+如果状态提示「补丁冲突」，请先完全退出 Cursor，并恢复同版本的官方文件。Manjaro/AUR 安装可执行 `pamac reinstall cursor-bin`；其他安装方式请使用原包管理器重新安装 Cursor 3.18.9。恢复后再运行：
+
+```bash
+cd /path/to/SandClaimer
+sudo -E -H env SAND_CURSOR_INSTALL_DIR=/usr/share/cursor python3 sand_patch.py install
+```
+
+安装成功后重启 Cursor；Agent Host 日志应出现 `move_exec ON: using @anysphere/agent-host-exec`，且不再出现 `undefined.execute`。不要在未清理第三方 direct-stream 注入时继续叠加补丁。
 
 ### Remote SSH 服务端
 
